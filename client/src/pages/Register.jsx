@@ -27,8 +27,12 @@ function Register() {
         password,
       });
 
-      navigate("/");
-    } catch (error) {
+      navigate("/verify-email", {
+        state: { email },
+      });
+    }
+    
+    catch (error) {
       setError(
         error.response?.data?.message ||
           "Registration failed"

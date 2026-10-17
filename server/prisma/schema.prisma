@@ -13,6 +13,10 @@ model User {
   email       String   @unique
   password    String
 
+  emailVerified          Boolean   @default(false)
+  verificationCode       Int?
+  verificationCodeExpiry DateTime?
+
   displayName String?
   avatar      String?
   bio         String?

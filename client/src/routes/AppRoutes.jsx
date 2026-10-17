@@ -5,6 +5,7 @@ import Register from "../pages/Register";
 import Home from "../pages/Home";
 import Chat from "../pages/Chat";
 import Profile from "../pages/Profile";
+import VerifyEmail from "../pages/VerifyEmail";
 
 import ProtectedRoute from "../components/common/ProtectedRoute";
 
@@ -14,6 +15,7 @@ function AppRoutes() {
       {/* Public routes */}
       <Route path="/" element={<Login />} />
       <Route path="/register" element={<Register />} />
+      <Route path="/verify-email" element={<VerifyEmail />} />
 
       {/* Protected routes */}
       <Route element={<ProtectedRoute />}>
