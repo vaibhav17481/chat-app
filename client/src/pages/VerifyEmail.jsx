@@ -1,6 +1,14 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { verifyEmail } from "../services/auth.service";
+import { verifyEmail, resendVerificationCode } from "../services/auth.service";
+import {
+  useOtpCooldown,
+  RESEND_COOLDOWN_SECONDS,
+} from "../hooks/useOtpCooldown";
+
+import AuthShell from "../components/auth/AuthShell";
+import AuthAlert from "../components/auth/AuthAlert";
+import AuthField, { authInputClass } from "../components/auth/AuthField";
 
 function VerifyEmail() {
   const location = useLocation();
@@ -9,11 +17,28 @@ function VerifyEmail() {
   const [email, setEmail] = useState(location.state?.email || "");
   const [code, setCode] = useState("");
   const [loading, setLoading] = useState(false);
+  const [resending, setResending] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
+  // Guards against duplicate requests.
+  const verifyInFlightRef = useRef(false);
+  const resendInFlightRef = useRef(false);
+
+  // A code was already mailed while the account was being created.
+  const {
+    remaining,
+    active: cooldownActive,
+    start: startCooldown,
+  } = useOtpCooldown(location.state?.cooldownRemaining || 0);
+
   const handleSubmit = async (e) => {
     e.preventDefault();
+
+    if (verifyInFlightRef.current) {
+      return;
+    }
+
     setError("");
     setSuccess("");
 
@@ -22,12 +47,14 @@ function VerifyEmail() {
       return;
     }
 
+    verifyInFlightRef.current = true;
+
     try {
       setLoading(true);
 
       const result = await verifyEmail({
         email: email.trim(),
-        code: Number(code),
+        code: code.trim(),
       });
 
       setSuccess(result.message || "Email verified successfully!");
@@ -35,92 +62,141 @@ function VerifyEmail() {
       setTimeout(() => navigate("/"), 1200);
     } catch (err) {
       setError(
-        err.response?.data?.message || "Verification failed. Please try again.",
+        err.response?.data?.message || "Verification failed. Please try again."
       );
     } finally {
+      verifyInFlightRef.current = false;
       setLoading(false);
     }
   };
 
+  const handleResend = async () => {
+    if (resendInFlightRef.current || cooldownActive) {
+      return;
+    }
+
+    setError("");
+    setSuccess("");
+
+    if (!email.trim()) {
+      setError("Enter your email address first.");
+      return;
+    }
+
+    resendInFlightRef.current = true;
+
+    try {
+      setResending(true);
+
+      const result = await resendVerificationCode({ email: email.trim() });
+
+      setSuccess(
+        result.message || "A new verification code has been sent to your email."
+      );
+      setCode("");
+      startCooldown(result.cooldownRemaining || RESEND_COOLDOWN_SECONDS);
+    } catch (err) {
+      const status = err.response?.status;
+      const payload = err.response?.data;
+
+      if (status === 429) {
+        const retryAfter =
+          payload?.retryAfter ??
+          payload?.cooldownRemaining ??
+          RESEND_COOLDOWN_SECONDS;
+
+        startCooldown(retryAfter);
+        setError(
+          payload?.message || "Please wait before requesting another code."
+        );
+      } else {
+        setError(
+          payload?.message || "Failed to resend the verification code."
+        );
+      }
+    } finally {
+      resendInFlightRef.current = false;
+      setResending(false);
+    }
+  };
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-950 px-4 text-white">
-      <div className="w-full max-w-md">
-        <div className="mb-8 text-center">
-          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-purple-600 text-3xl">
-            ✉️
-          </div>
+    <AuthShell
+      title="Verify your email"
+      subtitle="Enter the 6-digit code sent to your email address."
+      footer={
+        <>
+          Already verified?{" "}
+          <Link to="/" className="font-semibold text-accent hover:opacity-80">
+            Sign in
+          </Link>
+        </>
+      }
+    >
+      <form onSubmit={handleSubmit}>
+        <AuthAlert tone="error">{error}</AuthAlert>
+        <AuthAlert tone="success">{success}</AuthAlert>
 
-          <h1 className="text-3xl font-bold">Verify your email</h1>
+        <AuthField
+          id="verify-email"
+          label="Email"
+          type="email"
+          placeholder="you@example.com"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          autoComplete="email"
+          required
+        />
 
-          <p className="mt-2 text-slate-400">
-            Enter the 6-digit code sent to your email address.
-          </p>
-        </div>
-
-        <form
-          onSubmit={handleSubmit}
-          className="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl"
+        <label
+          htmlFor="verify-code"
+          className="mb-2 block text-sm font-medium text-muted"
         >
-          {error && (
-            <div className="mb-5 rounded-xl border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-400">
-              {error}
-            </div>
-          )}
+          Verification code
+        </label>
 
-          {success && (
-            <div className="mb-5 rounded-xl border border-green-500/20 bg-green-500/10 p-3 text-sm text-green-400">
-              {success}
-            </div>
-          )}
+        <input
+          id="verify-code"
+          type="text"
+          inputMode="numeric"
+          autoComplete="one-time-code"
+          maxLength={6}
+          placeholder="123456"
+          value={code}
+          onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+          required
+          className={`${authInputClass} mb-6 text-center text-2xl tracking-[0.5em]`}
+        />
 
-          <label className="mb-2 block text-sm font-medium text-slate-300">
-            Email
-          </label>
+        <button
+          type="submit"
+          disabled={loading || !!success}
+          className="w-full rounded-xl bg-accent py-3 font-semibold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {loading ? "Verifying..." : "Verify Email"}
+        </button>
 
-          <input
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            required
-            autoComplete="email"
-            className="mb-5 w-full rounded-xl border border-slate-700 bg-slate-800 px-4 py-3 outline-none focus:border-purple-500"
-          />
+        <button
+          type="button"
+          onClick={handleResend}
+          disabled={resending || loading || cooldownActive || !email.trim()}
+          className="mt-3 w-full rounded-xl border border-border py-3 font-semibold text-muted transition hover:bg-surface-raised hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {cooldownActive
+            ? `Resend OTP in ${remaining}s`
+            : resending
+              ? "Sending..."
+              : "Resend OTP"}
+        </button>
 
-          <label className="mb-2 block text-sm font-medium text-slate-300">
-            Verification code
-          </label>
-
-          <input
-            type="text"
-            inputMode="numeric"
-            autoComplete="one-time-code"
-            maxLength={6}
-            placeholder="123456"
-            value={code}
-            onChange={(e) =>
-              setCode(e.target.value.replace(/\D/g, "").slice(0, 6))
-            }
-            required
-            className="mb-6 w-full rounded-xl border border-slate-700 bg-slate-800 px-4 py-3 text-center text-2xl tracking-[0.5em] outline-none focus:border-purple-500"
-          />
-
-          <button
-            type="submit"
-            disabled={loading || !!success}
-            className="w-full rounded-xl bg-purple-600 py-3 font-semibold transition hover:bg-purple-500 disabled:opacity-50"
-          >
-            {loading ? "Verifying..." : "Verify Email"}
-          </button>
-
-          <p className="mt-6 text-center text-sm text-slate-400">
-            Already verified?{" "}
-            <Link to="/" className="font-semibold text-purple-400">
-              Sign in
-            </Link>
+        {cooldownActive && (
+          <p className="mt-2 text-center text-xs text-muted">
+            You can request a new code in {remaining} second
+            {remaining === 1 ? "" : "s"}.
           </p>
-        </form>
-      </div>
-    </div>
+        )}
+      </form>
+    </AuthShell>
   );
 }
 

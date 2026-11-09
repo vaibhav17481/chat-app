@@ -13,9 +13,17 @@ model User {
   email       String   @unique
   password    String
 
-  emailVerified          Boolean   @default(false)
-  verificationCode       Int?
+  emailVerified Boolean @default(false)
+
+  // The OTP itself is never stored: only a keyed hash of it (HMAC-SHA256).
+  verificationCodeHash   String?
   verificationCodeExpiry DateTime?
+
+  // When the current code was last emailed - used to enforce the resend cooldown.
+  verificationSentAt DateTime?
+
+  // Failed verification attempts for the current code.
+  verificationAttempts Int @default(0)
 
   displayName String?
   avatar      String?
@@ -32,6 +40,26 @@ model User {
 
   sentMessages     Message[] @relation("SentMessages")
   receivedMessages Message[] @relation("ReceivedMessages")
+
+  reactions Reaction[]
+
+  refreshTokens RefreshToken[]
+}
+
+// Long lived tokens used to mint access tokens. Only a hash of the token is
+// stored, so a leaked database row cannot be replayed. Every use rotates the
+// token and revokes its predecessor, which makes replay detectable.
+model RefreshToken {
+  id        String  @id @default(cuid())
+  userId    Int
+  tokenHash String  @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
 }
 
 model FriendRequest {
@@ -76,10 +104,38 @@ model Message {
 
   status String @default("SENT")
 
+  // Optional message this one replies to.
+  replyToId Int?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   sender   User @relation("SentMessages", fields: [senderId], references: [id])
 
   receiver User @relation("ReceivedMessages", fields: [receiverId], references: [id])
+
+  replyTo Message?  @relation("MessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+
+  replies   Message[] @relation("MessageReplies")
+
+  reactions Reaction[]
+}
+
+// A single emoji reaction on a message. One row per user, message and emoji
+// so the same person can never stack the same reaction twice.
+model Reaction {
+  id        Int      @id @default(autoincrement())
+
+  messageId Int
+  userId    Int
+  emoji     String
+
+  createdAt DateTime @default(now())
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId, emoji])
+  @@index([messageId])
 }

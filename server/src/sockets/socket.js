@@ -1,4 +1,5 @@
 import { Server } from "socket.io";
+import jwt from "jsonwebtoken";
 import prisma from "../lib/prisma.js";
 
 let io;
@@ -10,15 +11,37 @@ export const initSocket = (server) => {
     cors: {
       origin: "http://localhost:5173",
       methods: ["GET", "POST"],
+      credentials: true,
     },
   });
 
+  // The socket is authenticated with the same access token the API uses.
+  // The client can no longer claim an identity it does not own.
+  io.use((socket, next) => {
+    const token = socket.handshake.auth?.token;
+
+    if (!token) {
+      return next(new Error("Unauthorized - Missing Token"));
+    }
+
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+      socket.userId = decoded.userId;
+
+      return next();
+    } catch {
+      return next(new Error("Unauthorized - Invalid Token"));
+    }
+  });
+
   io.on("connection", (socket) => {
+    const userId = socket.userId;
+
     console.log("User connected:", socket.id);
 
-    socket.on("join", async (userId) => {
+    socket.on("join", async () => {
       userSocketMap[userId] = socket.id;
-      socket.userId = userId;
 
       // Mark any previously "sent" messages as delivered now that the user is online
       try {
@@ -57,7 +80,7 @@ export const initSocket = (server) => {
 
         if (receiverSocketId) {
           io.to(receiverSocketId).emit("userTyping", {
-            senderId: socket.userId,
+            senderId: userId,
           });
         }
       });
@@ -103,9 +126,7 @@ export const initSocket = (server) => {
         }
       });
 
-      console.log(
-        `User ${userId} connected with socket ${socket.id}`
-      );
+      console.log(`User ${userId} connected with socket ${socket.id}`);
 
       // Send current online users to everyone
       io.emit(
@@ -115,9 +136,9 @@ export const initSocket = (server) => {
     });
 
     socket.on("disconnect", () => {
-      for (const userId in userSocketMap) {
-        if (userSocketMap[userId] === socket.id) {
-          delete userSocketMap[userId];
+      for (const mappedUserId in userSocketMap) {
+        if (userSocketMap[mappedUserId] === socket.id) {
+          delete userSocketMap[mappedUserId];
           break;
         }
       }
@@ -141,6 +162,22 @@ export const getIO = () => {
   }
 
   return io;
+};
+
+// Emit an event to every given user that currently has a socket open.
+// Safe to call when the socket layer is not running (for example in tests).
+export const emitToUsers = (event, payload, userIds = []) => {
+  if (!io) return;
+
+  const targets = [...new Set(userIds.map(Number).filter(Number.isFinite))];
+
+  targets.forEach((userId) => {
+    const socketId = userSocketMap[userId];
+
+    if (socketId) {
+      io.to(socketId).emit(event, payload);
+    }
+  });
 };
 
 export const getReceiverSocketId = (userId) => {

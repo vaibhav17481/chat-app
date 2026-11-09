@@ -30,6 +30,10 @@ function MessageList({
   friend,
   onEditMessage,
   onDeleteMessage,
+  onReplyMessage,
+  onReactMessage,
+  onJumpToReply,
+  highlightedId,
 }) {
   const bottomRef = useRef(null);
 
@@ -37,7 +41,20 @@ function MessageList({
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length, isTyping]);
 
+  // Bring the message a reply points to into view
+  useEffect(() => {
+    if (!highlightedId) return;
+
+    const target = document.getElementById(`message-${highlightedId}`);
+
+    target?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [highlightedId]);
+
   let lastDay = null;
+
+  // The reply preview always shows the current state of the original message,
+  // so deleting that message is reflected right away.
+  const messagesById = new Map(messages.map((message) => [message.id, message]));
 
   return (
     <div className="flex-1 space-y-1 overflow-y-auto px-4 py-5 sm:px-6">
@@ -45,6 +62,10 @@ function MessageList({
         const label = dayLabel(message.createdAt);
         const showDivider = label !== lastDay;
         lastDay = label;
+
+        const replyTo = message.replyToId
+          ? (messagesById.get(message.replyToId) ?? message.replyTo)
+          : null;
 
         return (
           <div key={message.id}>
@@ -55,12 +76,18 @@ function MessageList({
                 </span>
               </div>
             )}
-            <div className="py-0.5">
+            <div className="py-0.5" id={`message-${message.id}`}>
               <MessageBubble
                 message={message}
+                replyTo={replyTo}
                 isMine={message.senderId === currentUserId}
+                currentUserId={currentUserId}
                 onEdit={onEditMessage}
                 onDelete={onDeleteMessage}
+                onReply={onReplyMessage}
+                onReact={onReactMessage}
+                onJumpToReply={onJumpToReply}
+                isHighlighted={message.id === highlightedId}
               />
             </div>
           </div>

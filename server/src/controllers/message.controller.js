@@ -1,13 +1,28 @@
 import prisma from "../lib/prisma.js";
-import { getIO, getReceiverSocketId } from "../sockets/socket.js";
+import { emitToUsers, getReceiverSocketId } from "../sockets/socket.js";
+import {
+  MESSAGE_RELATIONS,
+  getReactions,
+  isParticipant,
+  notifyParticipants,
+} from "../services/message.service.js";
+
+const EMOJI_MAX_LENGTH = 16;
+const EMOJI_PATTERN = /\p{Extended_Pictographic}/u;
 
 export const sendMessage = async (req, res) => {
   try {
-    const { receiverId, content } = req.body;
+    const { receiverId, content, replyToId } = req.body;
 
-    if (!receiverId || !content) {
+    if (!receiverId) {
       return res.status(400).json({
-        message: "Receiver ID and content are required",
+        message: "Receiver ID is required",
+      });
+    }
+
+    if (!content?.trim()) {
+      return res.status(400).json({
+        message: "Message content is required",
       });
     }
 
@@ -44,34 +59,71 @@ export const sendMessage = async (req, res) => {
       });
     }
 
+    // A reply may only point at a message of the very same conversation.
+    let replyTarget = null;
+
+    if (replyToId !== undefined && replyToId !== null && replyToId !== "") {
+      const replyToIdNumber = Number(replyToId);
+
+      if (!Number.isInteger(replyToIdNumber)) {
+        return res.status(400).json({
+          message: "Invalid reply target",
+        });
+      }
+
+      const target = await prisma.message.findUnique({
+        where: { id: replyToIdNumber },
+      });
+
+      if (!target) {
+        return res.status(404).json({
+          message: "The message you are replying to no longer exists",
+        });
+      }
+
+      const sameConversation =
+        (target.senderId === req.user.userId &&
+          target.receiverId === Number(receiverId)) ||
+        (target.receiverId === req.user.userId &&
+          target.senderId === Number(receiverId));
+
+      if (!sameConversation) {
+        return res.status(403).json({
+          message: "You can only reply to messages in this conversation",
+        });
+      }
+
+      if (target.deleted) {
+        return res.status(400).json({
+          message: "The message you are replying to was deleted",
+        });
+      }
+
+      replyTarget = target;
+    }
+
     const receiverSocketId = getReceiverSocketId(Number(receiverId));
 
     const message = await prisma.message.create({
       data: {
         senderId: req.user.userId,
         receiverId: Number(receiverId),
-        content,
+        content: content.trim(),
+        replyToId: replyTarget ? replyTarget.id : null,
         // If the receiver is online the message is already delivered
         status: receiverSocketId ? "DELIVERED" : "SENT",
       },
+      include: MESSAGE_RELATIONS,
     });
 
-    const io = getIO();
-
     // Let the sender know the delivery status in real time
-    const senderSocketId = getReceiverSocketId(req.user.userId);
-
-    if (senderSocketId) {
-      io.to(senderSocketId).emit("messageStatus", {
-        messageId: message.id,
-        status: message.status,
-      });
-    }
+    emitToUsers("messageStatus", {
+      messageId: message.id,
+      status: message.status,
+    }, [req.user.userId]);
 
     // Send the new message to the receiver in real time
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit("newMessage", message);
-    }
+    emitToUsers("newMessage", message, [Number(receiverId)]);
 
     return res.status(201).json({
       message: "Message sent successfully",
@@ -126,6 +178,7 @@ export const getConversation = async (req, res) => {
       orderBy: {
         createdAt: "asc",
       },
+      include: MESSAGE_RELATIONS,
     });
 
     return res.status(200).json(messages);
@@ -202,23 +255,11 @@ export const editMessage = async (req, res) => {
         content: content.trim(),
         edited: true,
       },
+      include: MESSAGE_RELATIONS,
     });
 
-    const io = getIO();
-
-    const receiverSocketId = getReceiverSocketId(message.receiverId);
-
-    // Tell receiver that this message was edited
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit("messageEdited", updatedMessage);
-    }
-
-    // Tell sender too, so multiple tabs/devices stay synchronized
-    const senderSocketId = getReceiverSocketId(message.senderId);
-
-    if (senderSocketId) {
-      io.to(senderSocketId).emit("messageEdited", updatedMessage);
-    }
+    // Tell both sides that this message was edited
+    notifyParticipants("messageEdited", updatedMessage, message);
 
     return res.status(200).json({
       message: "Message edited successfully",
@@ -264,25 +305,183 @@ export const deleteMessage = async (req, res) => {
         content: "This message was deleted",
         deleted: true,
       },
+      include: MESSAGE_RELATIONS,
     });
 
-    const io = getIO();
+    // Reactions on a deleted message make no sense anymore
+    await prisma.reaction.deleteMany({
+      where: {
+        messageId: Number(messageId),
+      },
+    });
 
-    const receiverSocketId = getReceiverSocketId(message.receiverId);
+    const clearedMessage = {
+      ...deletedMessage,
+      reactions: [],
+    };
 
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit("messageDeleted", deletedMessage);
-    }
-
-    const senderSocketId = getReceiverSocketId(message.senderId);
-
-    if (senderSocketId) {
-      io.to(senderSocketId).emit("messageDeleted", deletedMessage);
-    }
+    // Tell both sides that this message was deleted
+    notifyParticipants("messageDeleted", clearedMessage, message);
 
     return res.status(200).json({
       message: "Message deleted successfully",
-      data: deletedMessage,
+      data: clearedMessage,
+    });
+  } catch (error) {
+    console.log(error);
+
+    return res.status(500).json({
+      message: "Internal Server Error",
+    });
+  }
+};
+
+// Add, change or remove the reaction of the current user on a message.
+export const toggleReaction = async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    const { emoji } = req.body;
+
+    const messageIdNumber = Number(messageId);
+
+    if (!Number.isInteger(messageIdNumber)) {
+      return res.status(400).json({
+        message: "Invalid message id",
+      });
+    }
+
+    const emojiValue = typeof emoji === "string" ? emoji.trim() : "";
+
+    if (!emojiValue) {
+      return res.status(400).json({
+        message: "Emoji is required",
+      });
+    }
+
+    if (emojiValue.length > EMOJI_MAX_LENGTH) {
+      return res.status(400).json({
+        message: "Invalid emoji",
+      });
+    }
+
+    if (!EMOJI_PATTERN.test(emojiValue)) {
+      return res.status(400).json({
+        message: "Invalid emoji",
+      });
+    }
+
+    const message = await prisma.message.findUnique({
+      where: { id: messageIdNumber },
+    });
+
+    if (!message) {
+      return res.status(404).json({
+        message: "Message not found",
+      });
+    }
+
+    // Reactions are only allowed on messages of your own conversations
+    if (!isParticipant(message, req.user.userId)) {
+      return res.status(403).json({
+        message: "You can only react to messages in your conversations",
+      });
+    }
+
+    const existing = await prisma.reaction.findMany({
+      where: {
+        messageId: message.id,
+        userId: req.user.userId,
+      },
+    });
+
+    const sameEmoji = existing.find((reaction) => reaction.emoji === emojiValue);
+
+    if (sameEmoji) {
+      // Same emoji again removes the reaction
+      await prisma.reaction.delete({
+        where: { id: sameEmoji.id },
+      });
+    } else {
+      // A different emoji replaces the previous reaction, so a user always
+      // has at most one reaction per message and never the same one twice.
+      await prisma.reaction.deleteMany({
+        where: {
+          messageId: message.id,
+          userId: req.user.userId,
+        },
+      });
+
+      await prisma.reaction.create({
+        data: {
+          messageId: message.id,
+          userId: req.user.userId,
+          emoji: emojiValue,
+        },
+      });
+    }
+
+    const reactions = await getReactions(message.id);
+
+    // Both sides see the new reaction state in real time
+    notifyParticipants(
+      "messageReaction",
+      { messageId: message.id, reactions },
+      message
+    );
+
+    return res.status(200).json({
+      message: sameEmoji ? "Reaction removed" : "Reaction updated",
+      data: {
+        messageId: message.id,
+        reactions,
+        mine: sameEmoji ? null : emojiValue,
+      },
+    });
+  } catch (error) {
+    console.log(error);
+
+    return res.status(500).json({
+      message: "Internal Server Error",
+    });
+  }
+};
+
+// The full message including its reply target and reactions.
+export const getMessageReactions = async (req, res) => {
+  try {
+    const { messageId } = req.params;
+
+    const messageIdNumber = Number(messageId);
+
+    if (!Number.isInteger(messageIdNumber)) {
+      return res.status(400).json({
+        message: "Invalid message id",
+      });
+    }
+
+    const message = await prisma.message.findUnique({
+      where: { id: messageIdNumber },
+    });
+
+    if (!message) {
+      return res.status(404).json({
+        message: "Message not found",
+      });
+    }
+
+    if (!isParticipant(message, req.user.userId)) {
+      return res.status(403).json({
+        message: "You can only view messages in your conversations",
+      });
+    }
+
+    const reactions = await getReactions(message.id);
+
+    return res.status(200).json({
+      data: {
+        messageId: message.id,
+        reactions,
+      },
     });
   } catch (error) {
     console.log(error);

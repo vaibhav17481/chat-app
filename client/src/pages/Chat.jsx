@@ -6,6 +6,7 @@ import {
   sendMessage,
   editMessage,
   deleteMessage,
+  toggleReaction,
 } from "../services/message.service";
 
 import { getUserById } from "../services/user.service";
@@ -30,6 +31,8 @@ function Chat() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [isTyping, setIsTyping] = useState(false);
+  const [replyTo, setReplyTo] = useState(null);
+  const [highlightedId, setHighlightedId] = useState(null);
 
   // Load conversation + friend profile whenever the chat changes
   useEffect(() => {
@@ -125,9 +128,9 @@ function Chat() {
     };
   }, [id]);
 
-  const handleSend = async (content) => {
+  const handleSend = async (content, replyToId = null) => {
     try {
-      const response = await sendMessage(Number(id), content);
+      const response = await sendMessage(Number(id), content, replyToId);
 
       setMessages((prev) =>
         prev.some((m) => m.id === response.data.id)
@@ -137,6 +140,45 @@ function Chat() {
     } catch (err) {
       console.log(err);
       setError(err.response?.data?.message || "Failed to send message");
+      setTimeout(() => setError(null), 3000);
+    }
+  };
+
+  const handleReplyMessage = (message) => {
+    setReplyTo(message);
+  };
+
+  const handleCancelReply = () => {
+    setReplyTo(null);
+  };
+
+  // Jump to the message a reply points to and highlight it for a moment
+  const handleJumpToReply = (messageId) => {
+    setHighlightedId(messageId);
+  };
+
+  useEffect(() => {
+    if (highlightedId === null) return;
+
+    const timer = setTimeout(() => setHighlightedId(null), 2500);
+
+    return () => clearTimeout(timer);
+  }, [highlightedId]);
+
+  const handleReactMessage = async (messageId, emoji) => {
+    try {
+      const response = await toggleReaction(messageId, emoji);
+
+      setMessages((prev) =>
+        prev.map((message) =>
+          message.id === messageId
+            ? { ...message, reactions: response.data.reactions }
+            : message,
+        ),
+      );
+    } catch (err) {
+      console.log(err);
+      setError(err.response?.data?.message || "Failed to update reaction");
       setTimeout(() => setError(null), 3000);
     }
   };
@@ -175,6 +217,23 @@ function Chat() {
 
     return () => {
       socket.off("messageDeleted", handleMessageDeleted);
+    };
+  }, []);
+
+  // Live reaction updates for both sides of the conversation
+  useEffect(() => {
+    const handleMessageReaction = ({ messageId, reactions }) => {
+      setMessages((prev) =>
+        prev.map((message) =>
+          message.id === messageId ? { ...message, reactions } : message,
+        ),
+      );
+    };
+
+    socket.on("messageReaction", handleMessageReaction);
+
+    return () => {
+      socket.off("messageReaction", handleMessageReaction);
     };
   }, []);
 
@@ -240,6 +299,10 @@ function Chat() {
               friend={friend}
               onEditMessage={handleEditMessage}
               onDeleteMessage={handleDeleteMessage}
+              onReplyMessage={handleReplyMessage}
+              onReactMessage={handleReactMessage}
+              onJumpToReply={handleJumpToReply}
+              highlightedId={highlightedId}
             />
 
             {messages.length === 0 && (
@@ -254,7 +317,12 @@ function Chat() {
               </div>
             )}
 
-            <MessageInput onSend={handleSend} onTyping={handleTyping} />
+            <MessageInput
+              onSend={handleSend}
+              onTyping={handleTyping}
+              replyTo={replyTo}
+              onCancelReply={handleCancelReply}
+            />
           </>
         )}
       </div>

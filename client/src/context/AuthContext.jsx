@@ -1,6 +1,11 @@
 import { createContext, useContext, useEffect, useState } from "react";
-import api from "../services/api";
-import socket from "../services/socket";
+import api, {
+  getAccessToken,
+  setAccessToken,
+  setSessionExpiredHandler,
+  setTokenChangeHandler,
+} from "../services/api";
+import socket, { setSocketToken } from "../services/socket";
 
 const AuthContext = createContext();
 
@@ -9,52 +14,74 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const token = localStorage.getItem("token");
+    let cancelled = false;
 
-    if (!token) {
-      setLoading(false);
-      return;
-    }
-
-    const loadUser = async () => {
+    // The access token is only kept in memory, so a page reload has to renew
+    // the session with the httpOnly refresh cookie.
+    const restoreSession = async () => {
       try {
-        const response = await api.get("/users/profile");
+        const response = await api.post("/auth/refresh");
 
-        setUser(response.data);
+        if (cancelled) {
+          return;
+        }
 
-        socket.connect();
-      } catch (error) {
-        console.log("Failed to restore user:", error);
-
-        localStorage.removeItem("token");
-        setUser(null);
+        setAccessToken(response.data.token);
+        setUser(response.data.user);
+      } catch {
+        if (!cancelled) {
+          setAccessToken(null);
+          setUser(null);
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
     };
 
-    loadUser();
+    restoreSession();
 
     return () => {
+      cancelled = true;
       socket.disconnect();
+    };
+  }, []);
+
+  // A request that could not be renewed ends the session.
+  useEffect(() => {
+    setSessionExpiredHandler(() => {
+      socket.disconnect();
+      setAccessToken(null);
+      setUser(null);
+    });
+
+    // A renewed token is handed to the socket, so a reconnect is accepted.
+    setTokenChangeHandler((token) => setSocketToken(token));
+
+    return () => {
+      setSessionExpiredHandler(null);
+      setTokenChangeHandler(null);
     };
   }, []);
 
   useEffect(() => {
     if (!user) return;
 
+    // The handshake carries the access token, so it has to be set before the
+    // socket connects.
+    setSocketToken(getAccessToken());
+
     const handleConnect = () => {
-      console.log("Socket connected:", socket.id);
-
       socket.emit("join", user.id);
-
-      console.log("Joined socket as user:", user.id);
     };
+
+    socket.on("connect", handleConnect);
 
     if (socket.connected) {
       handleConnect();
     } else {
-      socket.on("connect", handleConnect);
+      socket.connect();
     }
 
     return () => {
@@ -62,10 +89,15 @@ export function AuthProvider({ children }) {
     };
   }, [user]);
 
-  const logout = () => {
-    socket.disconnect();
+  const logout = async () => {
+    try {
+      await api.post("/auth/logout");
+    } catch {
+      // The session is ended locally even when the request fails.
+    }
 
-    localStorage.removeItem("token");
+    socket.disconnect();
+    setAccessToken(null);
     setUser(null);
   };
 
